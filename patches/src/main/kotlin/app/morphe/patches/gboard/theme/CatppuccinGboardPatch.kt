@@ -99,7 +99,10 @@ val catppuccinGboardPatch = resourcePatch(
     default = false,
 ) {
     compatibleWith(Compatibility(name = "Gboard", packageName = "com.google.android.inputmethod.latin",
-        targets = listOf(AppTarget(version = "18.4.1.985164140-release-arm64-v8a"))))
+        targets = listOf(
+            AppTarget(version = "18.4.1.985164140-release-arm64-v8a"),
+            AppTarget(version = "18.5.4.993608717-release-arm64-v8a"),
+        )))
     execute {
         val colors = linkedMapOf<String, Long>()
         fun roles(color: Long, vararg names: String) { for (name in names) colors[name] = color }
@@ -147,6 +150,19 @@ val catppuccinGboardPatch = resourcePatch(
                 })
             }
         }
+        // Resource IDs are obfuscated and shift between Gboard builds, so find the stock
+        // theme-spec string by value instead of hardcoding its ID.
+        val strings = mutableMapOf<String, String>()
+        document("res/values/strings.xml").use { xml ->
+            val nodes = xml.documentElement.childNodes
+            for (i in 0 until nodes.length) {
+                val e = nodes.item(i) as? Element ?: continue
+                if (e.tagName == "string") strings[e.getAttribute("name")] = e.textContent
+            }
+        }
+        val stockSpec = "assets:theme_package_metadata_google_blue_dark.binarypb"
+        val anchors = strings.filterValues { it == stockSpec }.keys.map { "@string/$it" }.toMutableSet()
+        anchors += "@string/string_0x7f1408d8" // Gboard 18.4.1
         document("res/values/arrays.xml").use { xml ->
             val arrays = xml.documentElement.childNodes
             var catalog = false
@@ -155,8 +171,9 @@ val catppuccinGboardPatch = resourcePatch(
                 val array = arrays.item(i) as? Element ?: continue
                 val nodes = array.childNodes
                 val values = (0 until nodes.length).mapNotNull { (nodes.item(it) as? Element)?.textContent }
-                if ("@string/string_0x7f1408d8" !in values) continue
-                val withLabels = "@string/string_0x7f140595" in values
+                if (values.none { it in anchors }) continue
+                val withLabels = if ("@string/string_0x7f1408d8" in values) "@string/string_0x7f140595" in values
+                    else values.any { strings[it.removePrefix("@string/")]?.startsWith("assets:") != true }
                 if (withLabels) labels = true else catalog = true
                 if ("@string/catppuccin_gboard_spec" !in values) {
                     array.appendChild(xml.createElement("item").apply { textContent = "@string/catppuccin_gboard_spec" })
