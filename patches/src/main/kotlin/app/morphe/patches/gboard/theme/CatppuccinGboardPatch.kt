@@ -96,19 +96,64 @@ private fun mochaPalette(): Map<String, Long> {
 
 // Preserve the input APK's selector rules and unknown protobuf fields.
 // Only this new theme's named color bindings are replaced or appended.
-private fun palette(source: ByteArray, colors: Map<String, Long>): ByteArray {
+private fun readVarint(bytes: ByteArray): Long {
+    var result = 0L
+    for ((i, b) in bytes.withIndex()) {
+        result = result or ((b.toInt() and 127).toLong() shl (7 * i))
+        if ((b.toInt() and 128) == 0) break
+    }
+    return result
+}
+
+// Name-agnostic fallback: every bundled color that isn't explicitly mapped is
+// moved onto the closest Mocha role by hue/brightness, so keys etc. get themed too.
+private fun remap(argb: Long, mocha: Map<String, Long>): Long {
+    val a = (argb shr 24) and 255
+    if (a == 0L) return argb
+    val r = ((argb shr 16) and 255).toInt()
+    val g = ((argb shr 8) and 255).toInt()
+    val b = (argb and 255).toInt()
+    val chroma = maxOf(r, g, b) - minOf(r, g, b)
+    val lum = (r * 299 + g * 587 + b * 114) / 1000
+    val target = when {
+        chroma > 40 -> mocha.getValue("mauve")
+        lum < 40 -> mocha.getValue("base")
+        lum < 85 -> mocha.getValue("surface0")
+        lum < 150 -> mocha.getValue("overlay0")
+        else -> mocha.getValue("text")
+    }
+    return (a shl 24) or (target and 0xffffffL)
+}
+
+private fun palette(source: ByteArray, colors: Map<String, Long>, mocha: Map<String, Long>): ByteArray {
     val out = ByteArrayOutputStream()
     val seen = mutableSetOf<String>()
     fun binding(name: String, color: Long) = message(2,
         text(1, name) + message(2, varint(8) + varint(color)))
     for (field in fields(source)) {
-        val name = if (field.number == 2 && field.wire == 2)
-            fields(field.value).firstOrNull { it.number == 1 && it.wire == 2 }?.value?.toString(Charsets.UTF_8)
-        else null
-        val replacement = name?.let { colors[it] }
-        if (name != null && replacement != null) {
-            out.write(binding(name, replacement)); seen += name
-        } else out.write(field.raw)
+        if (field.number != 2 || field.wire != 2) { out.write(field.raw); continue }
+        val parts = fields(field.value)
+        val name = parts.firstOrNull { it.number == 1 && it.wire == 2 }?.value?.toString(Charsets.UTF_8)
+        val explicit = name?.let { colors[it] }
+        if (name != null && explicit != null) {
+            out.write(binding(name, explicit)); seen += name
+            continue
+        }
+        // Rebuild the binding, swapping only the color varint inside its value message.
+        val rebuilt = ByteArrayOutputStream()
+        for (part in parts) {
+            if (part.number == 2 && part.wire == 2) {
+                val inner = ByteArrayOutputStream()
+                for (v in fields(part.value)) {
+                    if (v.number == 1 && v.wire == 0) {
+                        val old = readVarint(v.value) and 0xffffffffL
+                        inner.write(varint(8) + varint(remap(old, mocha)))
+                    } else inner.write(v.raw)
+                }
+                rebuilt.write(message(2, inner.toByteArray()))
+            } else rebuilt.write(part.raw)
+        }
+        out.write(message(2, rebuilt.toByteArray()))
     }
     for ((name, color) in colors) if (name !in seen) out.write(binding(name, color))
     return out.toByteArray()
@@ -185,7 +230,7 @@ val catppuccinGboardPatch = resourcePatch(
         for (suffix in listOf("", "_border")) {
             val source = get(theme + "style_sheet_google_blue_dark$suffix.binarypb")
             require(source.isFile) { "This Gboard APK has a different bundled theme format" }
-            get(theme + "style_sheet_${THEME_ID}$suffix.binarypb").writeBytes(palette(source.readBytes(), colors))
+            get(theme + "style_sheet_${THEME_ID}$suffix.binarypb").writeBytes(palette(source.readBytes(), colors, mocha))
         }
         get(theme + "theme_package_metadata_$THEME_ID.binarypb").writeBytes(
             metadata(get(theme + "theme_package_metadata_google_blue_dark.binarypb").readBytes()))
